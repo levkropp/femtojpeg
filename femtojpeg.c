@@ -4,6 +4,7 @@
  * Decodes baseline sequential JPEG (SOF0) images to RGB565.
  * Winograd IDCT with 8-bit fixed-point integer math.
  * In-memory input, row-by-row output via callback.
+ * Supports 1/4 and 1/8 downscaling for large images.
  *
  * Inspired by picojpeg (public domain, Rich Geldreich).
  * Written from scratch for the Survival Workstation project.
@@ -20,6 +21,15 @@ typedef struct {
     uint16_t max_code[16];
     uint8_t  val_ptr[16];
 } huff_table_t;
+
+typedef struct {
+    size_t pos;
+    uint32_t bits;
+    int nbits;
+    int16_t last_dc[3];
+    uint16_t restarts_left;
+    uint8_t next_restart;
+} decode_save_t;
 
 typedef struct {
     /* Input */
@@ -49,13 +59,16 @@ typedef struct {
 
     /* Huffman tables: 0-1 = DC, 2-3 = AC */
     huff_table_t huff[4];
-    uint8_t huff_val[4][256];
-    uint8_t huff_nval[4];
+    uint8_t dc_vals[2][16];
+    uint8_t ac_vals[2][256];
 
     /* Restart interval */
     uint16_t restart_interval;
     uint16_t restarts_left;
     uint8_t  next_restart;
+
+    /* Scale factor */
+    uint8_t scale;
 
     /* Work buffer */
     int16_t block[64];
@@ -168,11 +181,12 @@ static void huff_build(const uint8_t *counts, huff_table_t *ht)
 static uint8_t huff_decode(fjctx_t *c, int table)
 {
     huff_table_t *ht = &c->huff[table];
+    const uint8_t *vals = (table < 2) ? c->dc_vals[table] : c->ac_vals[table - 2];
     uint16_t code = get_bit(c);
     for (int i = 0; i < 16; i++) {
         if (code <= ht->max_code[i] && ht->max_code[i] != 0xFFFF) {
             uint8_t j = ht->val_ptr[i] + (uint8_t)(code - ht->min_code[i]);
-            return c->huff_val[table][j];
+            return vals[j];
         }
         code = (code << 1) | get_bit(c);
     }
@@ -228,9 +242,15 @@ static int parse_dht(fjctx_t *c)
             counts[i] = read_u8(c);
             total += counts[i];
         }
-        for (int i = 0; i < total && i < 256; i++)
-            c->huff_val[table][i] = read_u8(c);
-        c->huff_nval[table] = (uint8_t)total;
+
+        /* Store values in split tables: DC→dc_vals, AC→ac_vals */
+        uint8_t *dst = (cls == 0) ? c->dc_vals[id] : c->ac_vals[id];
+        int max = (cls == 0) ? 16 : 256;
+        for (int i = 0; i < total && i < max; i++)
+            dst[i] = read_u8(c);
+        /* Skip excess values that don't fit */
+        for (int i = max; i < total; i++)
+            read_u8(c);
 
         huff_build(counts, &c->huff[table]);
         left -= 17 + total;
@@ -445,6 +465,61 @@ static int decode_block(fjctx_t *c, int comp, uint8_t *pixels)
     return 0;
 }
 
+/*--- DC-only block decode (1/8 scale) ---*/
+
+static int decode_block_dc_only(fjctx_t *c, int comp, uint8_t *pixel_out)
+{
+    int qtab = c->comp_qtab[comp];
+    const int16_t *q = c->qtab[qtab];
+
+    /* DC coefficient */
+    int dc_tab = c->comp_dc[comp];
+    uint8_t s = huff_decode(c, dc_tab);
+    uint8_t nbits = s & 0x0F;
+    int16_t dc = huff_extend(get_bits(c, nbits), nbits);
+    dc += c->last_dc[comp];
+    c->last_dc[comp] = dc;
+
+    /* The DC value after dequantization is the block average.
+     * q[0] is pre-scaled for Winograd, so we need to undo that scaling:
+     * raw_dequant = dc * original_qtab[0]
+     * But our qtab is pre-multiplied: qtab[0] = original * wquant[0] / 8
+     * wquant[0] = 128, so qtab[0] = original * 16
+     * After IDCT, each sample = DESCALE(dc * qtab[0]) + 128
+     * For DC-only, all 64 samples would be the same, so this is correct. */
+    *pixel_out = clamp8(DESCALE(dc * q[0]) + 128);
+
+    /* Consume AC coefficients to advance bitstream */
+    int ac_tab = c->comp_ac[comp] + 2;
+    for (int k = 1; k < 64; k++) {
+        s = huff_decode(c, ac_tab);
+        uint8_t run = s >> 4;
+        uint8_t size = s & 0x0F;
+        if (size == 0) {
+            if (run == 15) { k += 15; continue; }
+            break; /* EOB */
+        }
+        k += run;
+        if (k >= 64) return -1;
+        get_bits(c, size); /* skip AC value */
+    }
+    return 0;
+}
+
+/*--- 1/4 scale: average 8x8 block to 2x2 ---*/
+
+static void block_to_2x2(const uint8_t *blk, uint8_t out[4])
+{
+    for (int qy = 0; qy < 2; qy++)
+        for (int qx = 0; qx < 2; qx++) {
+            int sum = 0;
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++)
+                    sum += blk[(qy * 4 + y) * 8 + qx * 4 + x];
+            out[qy * 2 + qx] = (uint8_t)(sum >> 4);
+        }
+}
+
 /*--- Restart processing ---*/
 
 static void process_restart(fjctx_t *c)
@@ -463,6 +538,50 @@ static void process_restart(fjctx_t *c)
     c->last_dc[0] = c->last_dc[1] = c->last_dc[2] = 0;
     c->restarts_left = c->restart_interval;
     c->next_restart = (c->next_restart + 1) & 7;
+}
+
+/*--- Decoder state save/restore (for two-pass H2V2) ---*/
+
+static void save_state(const fjctx_t *c, decode_save_t *s)
+{
+    s->pos = c->pos;
+    s->bits = c->bits;
+    s->nbits = c->nbits;
+    s->last_dc[0] = c->last_dc[0];
+    s->last_dc[1] = c->last_dc[1];
+    s->last_dc[2] = c->last_dc[2];
+    s->restarts_left = c->restarts_left;
+    s->next_restart = c->next_restart;
+}
+
+static void restore_state(fjctx_t *c, const decode_save_t *s)
+{
+    c->pos = s->pos;
+    c->bits = s->bits;
+    c->nbits = s->nbits;
+    c->last_dc[0] = s->last_dc[0];
+    c->last_dc[1] = s->last_dc[1];
+    c->last_dc[2] = s->last_dc[2];
+    c->restarts_left = s->restarts_left;
+    c->next_restart = s->next_restart;
+}
+
+/*--- YCbCr to RGB565 ---*/
+
+static uint16_t ycbcr_to_rgb565(uint8_t Y, uint8_t Cb, uint8_t Cr)
+{
+    int cr = (int)Cr - 128;
+    int cb = (int)Cb - 128;
+    int r = (int)Y + ((cr * 359) >> 8);
+    int g = (int)Y - ((cb * 88 + cr * 183) >> 8);
+    int b = (int)Y + ((cb * 454) >> 8);
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
 /*--- Main decode ---*/
@@ -489,12 +608,16 @@ int fjpeg_info(const void *data, size_t len, fjpeg_info_t *info)
     return -1;
 }
 
-int fjpeg_decode(const void *data, size_t len, fjpeg_row_cb cb, void *user)
+int fjpeg_decode(const void *data, size_t len, int scale,
+                 fjpeg_row_cb cb, void *user)
 {
+    if (scale != 1 && scale != 4 && scale != 8) return -1;
+
     fjctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.data = data;
     ctx.len = len;
+    ctx.scale = (uint8_t)scale;
 
     if (parse_markers(&ctx) != 0) return -1;
     if (ctx.width == 0 || ctx.height == 0) return -1;
@@ -505,9 +628,21 @@ int fjpeg_decode(const void *data, size_t len, fjpeg_row_cb cb, void *user)
         ctx.next_restart = 0;
     }
 
-    /* Allocate row buffer: mcu_h rows of width pixels (RGB565) */
-    int row_stride = ctx.width;
-    uint16_t *row_buf = malloc((size_t)row_stride * ctx.mcu_h * sizeof(uint16_t));
+    /* Output dimensions */
+    int out_w = ctx.width / scale;
+    int out_h = ctx.height / scale;
+    if (out_w == 0 || out_h == 0) return -1;
+
+    /* Output MCU height and row buffer sizing */
+    int out_mcu_h = ctx.mcu_h / scale;
+    if (out_mcu_h < 1) out_mcu_h = 1;
+
+    /* Two-pass needed for H2V2 at 1:1 (mcu_h=16, but we only buffer 8 rows) */
+    int two_pass = (scale == 1 && ctx.mcu_h > 8);
+    int buf_rows = two_pass ? 8 : out_mcu_h;
+
+    /* Allocate row buffer */
+    uint16_t *row_buf = malloc((size_t)out_w * buf_rows * sizeof(uint16_t));
     if (!row_buf) return -1;
 
     /* Chroma subsampling shifts */
@@ -518,87 +653,160 @@ int fjpeg_decode(const void *data, size_t len, fjpeg_row_cb cb, void *user)
     int ny_h = ctx.ncomp == 1 ? 1 : ctx.hsamp[0];
     int ny_v = ctx.ncomp == 1 ? 1 : ctx.vsamp[0];
 
-    /* Decode MCU by MCU */
-    uint8_t y_blocks[4][64];  /* up to 4 Y blocks (for H2V2) */
+    /* Block storage */
+    uint8_t y_blocks[4][64];
     uint8_t cb_block[64], cr_block[64];
 
+    /* Scaled block storage for 1/4 mode */
+    uint8_t y_2x2[4][4];
+    uint8_t cb_2x2[4], cr_2x2[4];
+
+    decode_save_t saved = {0};
+
     for (int mcu_y = 0; mcu_y < ctx.mcus_y; mcu_y++) {
-        memset(row_buf, 0, (size_t)row_stride * ctx.mcu_h * sizeof(uint16_t));
+        int passes = two_pass ? 2 : 1;
 
-        for (int mcu_x = 0; mcu_x < ctx.mcus_x; mcu_x++) {
-            /* Restart interval check */
-            if (ctx.restart_interval) {
-                if (ctx.restarts_left == 0)
-                    process_restart(&ctx);
-                ctx.restarts_left--;
-            }
+        if (two_pass)
+            save_state(&ctx, &saved);
 
-            /* Decode Y blocks */
-            for (int vy = 0; vy < ny_v; vy++) {
-                for (int hx = 0; hx < ny_h; hx++) {
-                    if (decode_block(&ctx, 0, y_blocks[vy * ny_h + hx]) != 0)
-                        goto fail;
+        for (int pass = 0; pass < passes; pass++) {
+            if (pass == 1)
+                restore_state(&ctx, &saved);
+
+            /* py_base: which pixel row within the MCU this pass starts at */
+            int py_base = two_pass ? (pass * 8) : 0;
+
+            memset(row_buf, 0, (size_t)out_w * buf_rows * sizeof(uint16_t));
+
+            for (int mcu_x = 0; mcu_x < ctx.mcus_x; mcu_x++) {
+                /* Restart interval check */
+                if (ctx.restart_interval) {
+                    if (ctx.restarts_left == 0)
+                        process_restart(&ctx);
+                    ctx.restarts_left--;
                 }
-            }
 
-            /* Decode Cb, Cr blocks */
-            if (ctx.ncomp == 3) {
-                if (decode_block(&ctx, 1, cb_block) != 0) goto fail;
-                if (decode_block(&ctx, 2, cr_block) != 0) goto fail;
-            }
+                if (scale == 8) {
+                    /*--- 1/8 scale: DC-only ---*/
+                    uint8_t y_dc[4], cb_dc, cr_dc;
 
-            /* Convert MCU to RGB565 in row_buf */
-            int px0 = mcu_x * ctx.mcu_w;
-            for (int py = 0; py < ctx.mcu_h; py++) {
-                int img_y = mcu_y * ctx.mcu_h + py;
-                if (img_y >= ctx.height) break;
+                    for (int vy = 0; vy < ny_v; vy++)
+                        for (int hx = 0; hx < ny_h; hx++)
+                            if (decode_block_dc_only(&ctx, 0, &y_dc[vy * ny_h + hx]) != 0)
+                                goto fail;
 
-                for (int px = 0; px < ctx.mcu_w; px++) {
-                    int img_x = px0 + px;
-                    if (img_x >= ctx.width) break;
-
-                    uint8_t Y, Cb_v, Cr_v;
-
-                    if (ctx.ncomp == 1) {
-                        Y = y_blocks[0][py * 8 + px];
-                        Cb_v = 128; Cr_v = 128;
+                    if (ctx.ncomp == 3) {
+                        if (decode_block_dc_only(&ctx, 1, &cb_dc) != 0) goto fail;
+                        if (decode_block_dc_only(&ctx, 2, &cr_dc) != 0) goto fail;
                     } else {
-                        /* Which Y block? */
-                        int yb = (py >> 3) * ny_h + (px >> 3);
-                        Y = y_blocks[yb][(py & 7) * 8 + (px & 7)];
-
-                        /* Chroma with nearest-neighbor upsampling */
-                        int cx = px >> h_shift;
-                        int cy = py >> v_shift;
-                        Cb_v = cb_block[cy * 8 + cx];
-                        Cr_v = cr_block[cy * 8 + cx];
+                        cb_dc = 128; cr_dc = 128;
                     }
 
-                    /* YCbCr to RGB (fixed-point) */
-                    int cr = (int)Cr_v - 128;
-                    int cb_val = (int)Cb_v - 128;
-                    int r = (int)Y + ((cr * 359) >> 8);
-                    int g = (int)Y - ((cb_val * 88 + cr * 183) >> 8);
-                    int b = (int)Y + ((cb_val * 454) >> 8);
+                    /* Each MCU → (ny_h × ny_v) output pixels at 1/8 */
+                    int ox0 = mcu_x * ny_h;
+                    for (int vy = 0; vy < ny_v; vy++) {
+                        for (int hx = 0; hx < ny_h; hx++) {
+                            int ox = ox0 + hx;
+                            int oy = vy;  /* row within this MCU's output */
+                            if (ox >= out_w || oy >= buf_rows) continue;
 
-                    if (r < 0) r = 0;
-                    if (r > 255) r = 255;
-                    if (g < 0) g = 0;
-                    if (g > 255) g = 255;
-                    if (b < 0) b = 0;
-                    if (b > 255) b = 255;
+                            uint8_t Y = y_dc[vy * ny_h + hx];
+                            uint8_t Cb_v = cb_dc, Cr_v = cr_dc;
+                            row_buf[oy * out_w + ox] = ycbcr_to_rgb565(Y, Cb_v, Cr_v);
+                        }
+                    }
+                } else if (scale == 4) {
+                    /*--- 1/4 scale: full IDCT then average 4x4 quadrants ---*/
+                    for (int vy = 0; vy < ny_v; vy++)
+                        for (int hx = 0; hx < ny_h; hx++) {
+                            if (decode_block(&ctx, 0, y_blocks[vy * ny_h + hx]) != 0)
+                                goto fail;
+                            block_to_2x2(y_blocks[vy * ny_h + hx], y_2x2[vy * ny_h + hx]);
+                        }
 
-                    row_buf[py * row_stride + img_x] =
-                        ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+                    if (ctx.ncomp == 3) {
+                        if (decode_block(&ctx, 1, cb_block) != 0) goto fail;
+                        if (decode_block(&ctx, 2, cr_block) != 0) goto fail;
+                        block_to_2x2(cb_block, cb_2x2);
+                        block_to_2x2(cr_block, cr_2x2);
+                    } else {
+                        memset(cb_2x2, 128, 4);
+                        memset(cr_2x2, 128, 4);
+                    }
+
+                    /* Each 8x8 block → 2x2 pixels. MCU → (ny_h*2 × ny_v*2) pixels */
+                    int ox0 = mcu_x * ny_h * 2;
+                    for (int vy = 0; vy < ny_v; vy++) {
+                        for (int hx = 0; hx < ny_h; hx++) {
+                            uint8_t *yp = y_2x2[vy * ny_h + hx];
+                            for (int sy = 0; sy < 2; sy++) {
+                                for (int sx = 0; sx < 2; sx++) {
+                                    int ox = ox0 + hx * 2 + sx;
+                                    int oy = vy * 2 + sy;
+                                    if (ox >= out_w || oy >= buf_rows) continue;
+
+                                    uint8_t Y = yp[sy * 2 + sx];
+                                    /* Chroma: nearest-neighbor from scaled chroma */
+                                    int cx = (hx * 2 + sx) >> h_shift;
+                                    int cy = (vy * 2 + sy) >> v_shift;
+                                    uint8_t Cb_v = cb_2x2[cy * 2 + cx];
+                                    uint8_t Cr_v = cr_2x2[cy * 2 + cx];
+
+                                    row_buf[oy * out_w + ox] = ycbcr_to_rgb565(Y, Cb_v, Cr_v);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    /*--- 1:1 scale ---*/
+                    for (int vy = 0; vy < ny_v; vy++)
+                        for (int hx = 0; hx < ny_h; hx++)
+                            if (decode_block(&ctx, 0, y_blocks[vy * ny_h + hx]) != 0)
+                                goto fail;
+
+                    if (ctx.ncomp == 3) {
+                        if (decode_block(&ctx, 1, cb_block) != 0) goto fail;
+                        if (decode_block(&ctx, 2, cr_block) != 0) goto fail;
+                    }
+
+                    /* Convert MCU to RGB565 in row_buf */
+                    int px0 = mcu_x * ctx.mcu_w;
+                    for (int py = py_base; py < py_base + buf_rows; py++) {
+                        int img_y = mcu_y * ctx.mcu_h + py;
+                        if (img_y >= ctx.height) break;
+
+                        for (int px = 0; px < ctx.mcu_w; px++) {
+                            int img_x = px0 + px;
+                            if (img_x >= out_w) break;
+
+                            uint8_t Y, Cb_v, Cr_v;
+
+                            if (ctx.ncomp == 1) {
+                                Y = y_blocks[0][py * 8 + px];
+                                Cb_v = 128; Cr_v = 128;
+                            } else {
+                                int yb = (py >> 3) * ny_h + (px >> 3);
+                                Y = y_blocks[yb][(py & 7) * 8 + (px & 7)];
+                                int cx = px >> h_shift;
+                                int cy = py >> v_shift;
+                                Cb_v = cb_block[cy * 8 + cx];
+                                Cr_v = cr_block[cy * 8 + cx];
+                            }
+
+                            row_buf[(py - py_base) * out_w + img_x] =
+                                ycbcr_to_rgb565(Y, Cb_v, Cr_v);
+                        }
+                    }
                 }
             }
-        }
 
-        /* Deliver pixel rows */
-        for (int py = 0; py < ctx.mcu_h; py++) {
-            int img_y = mcu_y * ctx.mcu_h + py;
-            if (img_y >= ctx.height) break;
-            cb(img_y, ctx.width, row_buf + py * row_stride, user);
+            /* Deliver pixel rows */
+            int base_y = mcu_y * out_mcu_h + (two_pass ? pass * 8 : 0);
+            for (int py = 0; py < buf_rows; py++) {
+                int img_y = base_y + py;
+                if (img_y >= out_h) break;
+                cb(img_y, out_w, row_buf + py * out_w, user);
+            }
         }
     }
 
