@@ -581,9 +581,12 @@ int fjpeg_decode(const void *data, size_t len, fjpeg_row_cb cb, void *user)
                     int g = (int)Y - ((cb_val * 88 + cr * 183) >> 8);
                     int b = (int)Y + ((cb_val * 454) >> 8);
 
-                    if (r < 0) r = 0; if (r > 255) r = 255;
-                    if (g < 0) g = 0; if (g > 255) g = 255;
-                    if (b < 0) b = 0; if (b > 255) b = 255;
+                    if (r < 0) r = 0;
+                    if (r > 255) r = 255;
+                    if (g < 0) g = 0;
+                    if (g > 255) g = 255;
+                    if (b < 0) b = 0;
+                    if (b > 255) b = 255;
 
                     row_buf[py * row_stride + img_x] =
                         ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
