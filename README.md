@@ -70,10 +70,10 @@ add_executable(myapp main.c femtojpeg.c)
 |---------|------:|---------|:---------:|:------:|:-----------:|:-------:|:------------:|----:|
 | **femtojpeg** | **~800** | **MIT** | **yes** | **yes** | no | **1/4/8** | **none** | **~7 KB** |
 | picojpeg | ~2,500 | PD/MIT | MCU-level | no | no | 1/8 reduce | none | ~2.3 KB |
-| TJpgDec | ~1,800 | BSD | yes | yes | no | 1/2/4/8 | none | ~3.5 KB |
+| TJpgDec | ~1,300 | Permissive | yes | yes | no | 1/2/4/8 | none | ~3.5 KB |
 | NanoJPEG | ~900 | MIT | no | no | no | no | none | ~512 KB |
 | stb_image | ~2,500 | PD/MIT | no | no | yes | no | none | full image |
-| esp_jpeg | ~1,800 | Apache-2.0 | yes | yes | no | 1/2/4/8 | ESP-IDF | ~3.5 KB |
+| esp_jpeg | ~2,000 | Apache-2.0 | yes | yes | no | 1/2/4/8 | ESP-IDF | ~3.1 KB |
 
 femtojpeg prioritizes minimal code size and zero dependencies. RAM usage is ~7 KB for 320px H2V2 at 1:1 (two-pass decode halves the row buffer), ~4 KB at 1/4 scale, and ~3 KB at 1/8 scale. The 1/8 mode is DC-only (no IDCT), making it very fast for generating thumbnails from large images.
 
